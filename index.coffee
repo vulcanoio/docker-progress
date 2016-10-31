@@ -134,7 +134,7 @@ DEFAULT_PROGRESS_BAR_STEP_COUNT = 50
 
 # Builds and returns a Docker-like progress bar like this:
 # [==================================>               ] XXX.XX MB/178.83 MB - 64%
-renderProgress = (percentage, completed, total, stepCount = DEFAULT_PROGRESS_BAR_STEP_COUNT) ->
+renderProgress = (percentage, completed, total, { stepCount = DEFAULT_PROGRESS_BAR_STEP_COUNT } = {}) ->
 	barCount =  stepCount * percentage // 100
 	spaceCount = stepCount - barCount
 	bar = "[#{_.repeat('=', barCount)}>#{_.repeat(' ', spaceCount)}]"
@@ -295,62 +295,23 @@ exports.DockerProgress = class DockerProgress
 	# Get size of all layers of a local image
 	# "image" is a string, the name of the docker image
 	getImageLayerSizes: (image) ->
-		d = @docker
-		d.getImage(image).historyAsync()
-		.then (layers) ->
-			# roll-up sizes of layers with ID <missing> onto the parent.
-			# for example, transforms this:
-			#
-			# [{"Id": "sha256:a145e85e1...", "Size": 0, ...},
-			#  {"Id": "<missing>", "Size": 207, ...},
-			#  {"Id": "<missing>", "Size": 2125, ...}]
-			#
-			# to this: [{"Id": "sha256:a145e85e1...", "Size": 2332, ...}]
-			concreteLayers = []
-			accumulatedSize = 0
-			_.forEachRight layers, (layer) ->
-				if layer.Id is '<missing>'
-					accumulatedSize += layer.Size
-				else
-					layer.Size += accumulatedSize
-					accumulatedSize = 0
-					concreteLayers.push(layer)
-			return concreteLayers
-		.map (layer) ->
-			# transform into something like this:
-			# [ {id: "bb12b...", size: 1339, blobs: [ "a694d3...", ... ]}, ... ]
-			d.getImage(layer['Id']).inspectAsync().then (info) ->
-				id: stripShaPrefix(layer['Id'])
-				size: layer['Size']
-				blobs: _(info['RootFS']['Layers'])
-					.map(stripShaPrefix)
-					.uniq()
-					.value()
-		.then (layers) ->
-			# each layer references all blobs it's made of. for each layer
-			# keep only layer-specific blobs, dropping older ones.
-			knownBlobs = null
-			_.forEach layers, (layer) ->
-				if not knownBlobs?
-					knownBlobs = layer.blobs
-					return
-				layer.blobs = _.dropWhile layer.blobs, (blob) ->
-					_.includes(knownBlobs, blob)
-				knownBlobs = knownBlobs.concat(layer.blobs)
-			return layers
-		.then (layers) ->
-			# distribute the layer size uniformly across each layer's blobs
+		image = @docker.getImage(image)
+		layers = image.historyAsync()
+		lastLayer = image.inspectAsync()
+		Promise.join layers, lastLayer, (layers, lastLayer) ->
+			totalSize = _.sumBy(layers, 'Size')
+			blobs = _.map(lastLayer['RootFS']['Layers'], stripShaPrefix)
+			# distribute the layer size uniformly across the image's blobs
 			# and return a map of all known blob IDs to their size.
-			_(layers)
-				.flatMap (layer) ->
-					blobCount = layer.blobs.length
-					return [] if blobCount is 0
-					blobSize = layer.size // blobCount
-					remainder = layer.size - blobSize * blobCount
-					_.map layer.blobs, (blobId, index) ->
-						[ blobId, blobSize + (if index is 0 then remainder else 0) ]
-				.fromPairs()
-				.value()
+			blobCount = blobs.length
+			return {} if blobCount is 0
+			blobSize = totalSize // blobCount
+			remainder = totalSize % blobSize
+			blobSizesById = {}
+			_.forEach blobs, (blob, index) ->
+				blobSizesById[blob] ?= 0
+				blobSizesById[blob] += blobSize + (if index is 0 then remainder else 0)
+			return blobSizesById
 
 	# Create a stream that transforms `docker.modem.followProgress` onProgress
 	# events to include total progress metrics.
@@ -380,7 +341,7 @@ exports.DockerProgress = class DockerProgress
 						completedSize += layerSizes[remoteId]
 						layerPushedSize[shortId] = 0
 					# registry1-only statuses
-					else if _.includes(['Already exists', 'Layer already exists', 'Image successfully pushed'], status) or pushMatch
+					else if pushMatch or _.includes(['Already exists', 'Layer already exists', 'Image successfully pushed'], status)
 						shortId or= pushMatch[1]
 						remoteId = layerIds[shortId]
 						completedSize += layerSizes[remoteId]
